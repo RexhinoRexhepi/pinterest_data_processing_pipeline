@@ -1,49 +1,121 @@
-# Pinterest Data Collection Pipeline
+# Pinterest Data Pipeline
 
-This project implements a data collection pipeline for gathering data from Pinterest using FastAPI for user emulation. The collected data is then moved to a Kafka topic for further processing. Additionally, the pipeline supports batch collection, where data is extracted from the Kafka topic and stored in an AWS S3 bucket using Spark. For orchestration of the batch process, Airflow is utilized. The pipeline also includes a streaming process, where Spark is employed to gather and clean data, and then load it directly into a PostgreSQL database.
+This project implements an end-to-end data pipeline to ingest and process Pinterest data. It contains the following components:
 
-## Architecture
+- API to collect Pinterest post data
+- Kafka producer to publish messages
+- Kafka consumer to read messages
+- Upload JSON files to S3
+- Spark job to process data from S3
+- Airflow DAG to orchestrate Spark job
+- Spark Structured Streaming from Kafka to PostgreSQL
 
-The Pinterest Data Collection Pipeline consists of several components working together:
+## API
 
-- **FastAPI**: The FastAPI framework is used to emulate user interactions with Pinterest. It provides an API endpoint `/pin/` that accepts POST requests and collects data from the Pinterest platform. The received data is then serialized and sent to the Kafka topic `pinterest_topic` using a Kafka producer.
+The FastAPI collects Pinterest post data and publishes to a Kafka topic:
 
-- **Kafka**: The Kafka topic `pinterest_topic` acts as a buffer between the data collection (FastAPI) and further processing steps. It ensures reliable and scalable data transfer, allowing for decoupling of data collection and processing.
+```python
+@app.post("/pin/")
+def get_db_row(item: Data):
 
-- **Batch Processing (Spark and AWS S3)**: The batch processing step involves reading data from the Kafka topic `pinterest_topic` using a Kafka consumer. Each message is then uploaded to an AWS S3 bucket (`pinterest-data-26b723b8-a429-4cd5-9afb-a032ed2dd8c7`) as a separate JSON file. This process is performed using the `KafkaConsumer` and `boto3` libraries. The batch processing step is triggered by an Airflow DAG (`s3_spark_dag`) that schedules and executes the Spark job to retrieve data from Kafka and upload it to AWS S3.
+  data = dict(item)
+ 
+  pinterest_producer = KafkaProducer(
+    bootstrap_servers="localhost:9092",
+    client_id="pinterest_pipeline",
+    value_serializer=lambda m: dumps(m).encode("ascii")
+  )
 
-- **Streaming Processing (Spark and PostgreSQL)**: The streaming processing step uses Spark to read data from the Kafka topic `pinterest_topic` in real-time. Each message is parsed, transformed, and cleaned, and then loaded into a PostgreSQL database (`pinterest_streaming`), specifically the table `public.experimental_data`. The streaming processing step is implemented using Spark Structured Streaming and the PostgreSQL JDBC connector.
+  pinterest_producer.send(topic="pinterest_topic", value=data)
 
-## Setup and Configuration
+  return item
+```
 
-To set up the Pinterest Data Collection Pipeline, follow these steps:
+The `Data` model defines the schema:
 
-1. Clone the project repository to your local machine.
+```python
+class Data(BaseModel):
 
-2. Install the required dependencies by running `pip install -r requirements.txt`.
+  category: str
+  index: int
+  unique_id: str
+  # other attributes
+```
 
-3. Configure the necessary settings in the configuration files:
+## Kafka Producer
 
-   - `config/fastapi_config.py`: Set the appropriate Pinterest API credentials and any other relevant configurations for FastAPI.
+The producer publishes messages to Kafka topic `pinterest_topic`:
 
-   - `config/kafka_config.py`: Specify the Kafka broker and topic information.
+```python
+from kafka import KafkaProducer
+import json
 
-   - `config/spark_config.py`: Configure the Spark cluster connection details and any other relevant Spark settings.
+producer = KafkaProducer(
+  bootstrap_servers='localhost:9092',
+  value_serializer=lambda m: json.dumps(m).encode('utf-8') 
+)
 
-   - `config/airflow_config.py`: Set the Airflow scheduler and executor configurations.
+producer.send('pinterest_topic', data)
+```
 
-   - `config/postgresql_config.py`: Provide the connection details for the PostgreSQL database.
+## Kafka Consumer
 
-4. Start the FastAPI server by running `uvicorn main:app --reload` in the project root directory.
+The consumer reads messages from `pinterest_topic` and saves to S3:
 
-5. Configure Airflow by running `airflow initdb` to initialize the Airflow database.
+```python
+from kafka import KafkaConsumer
+import json
 
-6. Define your batch processing workflow using Airflow's DAG (Directed Acyclic Graph) definition. Place your DAG file in the `dags/` directory.
+consumer = KafkaConsumer(
+  'pinterest_topic',
+  bootstrap_servers=['localhost:9092'],
+  value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+)
 
-7. Start the Airflow scheduler and web server using `airflow scheduler` and `airflow webserver`, respectively.
+for message in consumer:
+ 
+  # save message to S3
+  s3.put_object(Body=json.dumps(message.value), Bucket='mybucket', Key=f'message_{i}.json')
+```
 
-8. Implement the necessary Spark code to read data from the Kafka topic and perform the required transformations for both batch processing (writing to AWS S3) and streaming processing (writing to PostgreSQL).
+## Spark Processing
 
-9. Run the Airflow DAG to execute the batch processing workflow according to your defined schedule.
+Spark is used to process the raw JSON files from S3:
 
-10. Verify that the processed data is successfully stored in the AWS S3 bucket and the PostgreSQL database.
+```python
+df = spark.read.json('s3a://mybucket/*.json')
+
+cleaned_df = transform(df)
+
+cleaned_df.write.parquet('s3a://mybucket/cleaned')
+```
+
+The `transform()` function cleans the data.
+
+## Airflow DAG
+
+Airflow orchestrates running the Spark job:
+
+```python
+spark_task = BashOperator(
+  task_id='spark_task',
+  bash_command='spark-submit --packages com.amazonaws:aws-java-sdk-s3:1.12.61,org.apache.hadoop:hadoop-aws:3.3.2 s3_to_spark.py'
+)
+```
+
+## Spark Streaming to PostgreSQL
+
+Finally, Spark Structured Streaming is used to stream new messages from Kafka to PostgreSQL:
+
+```python
+df = spark.readStream.format("kafka").load()
+
+df.writeStream.foreachBatch(write_to_postgres).start()
+
+def write_to_postgres(df, epoch_id):
+  df.write.jdbc(url="jdbc:postgresql://localhost/mydb", table="messages")
+```
+
+This loads new messages from Kafka and inserts them into a PostgreSQL table.
+
+The full code for this project is available in this repository. The project implements an end-to-end pipeline to collect Pinterest data, process with Spark, and load into PostgreSQL for analysis.
